@@ -31,7 +31,7 @@ from gi.repository import Gdk, Gio, GLib, Gst, Gtk, Pango  # noqa: E402
 
 APP_ID = "com.oliver.ScreenRecord"
 APP_NAME = "Oliver Screen Record"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 PORTAL_BUS = "org.freedesktop.portal.Desktop"
 PORTAL_PATH = "/org/freedesktop/portal/desktop"
@@ -40,6 +40,19 @@ IFACE_REQUEST = "org.freedesktop.portal.Request"
 IFACE_SESSION = "org.freedesktop.portal.Session"
 
 CONFIG_FILE = os.path.join(GLib.get_user_config_dir(), "oliver-screen-record", "config.json")
+LOG_FILE = os.path.join(GLib.get_user_cache_dir(), "oliver-screen-record", "oliver-screen-record.log")
+
+
+def log(text):
+    """Escreve no terminal e em LOG_FILE (útil quando o app é aberto pelo menu)."""
+    line = f"{datetime.now():%H:%M:%S} {text}"
+    print(line, file=sys.stderr, flush=True)
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 # Tipos de fonte do portal ScreenCast
 SOURCE_MONITOR, SOURCE_WINDOW = 1, 2
@@ -138,7 +151,7 @@ class Config(dict):
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self, f, indent=2, ensure_ascii=False)
         except OSError as e:
-            print(f"[config] não foi possível salvar: {e}", file=sys.stderr)
+            log(f"[config] não foi possível salvar: {e}")
 
 
 # --------------------------------------------------------------------------- #
@@ -438,6 +451,7 @@ class Recorder:
         self._sized = False
         self._gates = []
         self._last_pts = {}
+        self.frames = 0                 # quadros de vídeo entregues ao encoder
         self._paused = start_paused
         self._pause_started = 0 if start_paused else None
         self._pause_total = 0
@@ -495,6 +509,8 @@ class Recorder:
                 "audiomixer name=amix ! audio/x-raw,rate=48000,channels=2 ! audioconvert "
                 f"! queue name=agate ! {aenc} ! queue ! mux.")
 
+        log(f"[gravação] arquivo: {self.path}")
+        log("[gravação] pipeline: " + " ".join(desc))
         self.pipeline = Gst.parse_launch(" ".join(desc))
         self.pipeline.use_clock(Gst.SystemClock.obtain())
         self.pipeline.get_by_name("sink").set_property("location", self.path)
@@ -541,6 +557,8 @@ class Recorder:
             if last is not None and pts <= last:
                 return Gst.PadProbeReturn.DROP
             self._last_pts[pad] = pts
+        if pad is self._gates[0]:
+            self.frames += 1
         return Gst.PadProbeReturn.OK
 
     # ---------- controle ----------
@@ -576,6 +594,7 @@ class Recorder:
         if self.pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
             self._finish(False, "Não foi possível iniciar o pipeline de gravação.")
             return False
+        log("[gravação] iniciada")
         if self._paused:
             # "Começar pausado": a pausa começa no instante 0 do pipeline
             self._pause_started = 0
@@ -584,6 +603,7 @@ class Recorder:
     def stop(self):
         if self._finished or not self.pipeline:
             return
+        log(f"[gravação] parando (tempo gravado: {self.elapsed() // Gst.SECOND}s)")
         if self._paused:
             self.resume()  # fecha o intervalo pausado; EOS passa pelos portões normalmente
             self._paused = True  # continua descartando até o EOS chegar
@@ -597,11 +617,11 @@ class Recorder:
             self._finish(True, "Gravação salva.")
         elif msg.type == Gst.MessageType.ERROR:
             err, dbg = msg.parse_error()
-            print(f"[gst] ERRO ({msg.src.get_name()}): {err.message}\n{dbg}", file=sys.stderr)
+            log(f"[gst] ERRO ({msg.src.get_name()}): {err.message}\n{dbg}")
             self._finish(False, err.message)
         elif msg.type == Gst.MessageType.WARNING:
             w, _dbg = msg.parse_warning()
-            print(f"[gst] aviso: {w.message}", file=sys.stderr)
+            log(f"[gst] aviso: {w.message}")
 
     def _finish(self, ok, message):
         if self._finished:
@@ -616,6 +636,7 @@ class Recorder:
             os.close(self.fd)
         except OSError:
             pass
+        log(f"[gravação] fim: ok={ok} quadros={self.frames} mensagem={message}")
         if self.on_done:
             self.on_done(ok, message)
 
@@ -675,7 +696,7 @@ class CameraFeed:
         base = self.camera.get("base")
         if not self._fallback_used and base:
             self._fallback_used = True
-            print(f"[câmera] {message} Tentando outro formato…", file=sys.stderr)
+            log(f"[câmera] {message} Tentando outro formato…")
             self.stop()
             try:
                 self._build(f"{base} ! decodebin")
@@ -694,7 +715,7 @@ class CameraFeed:
     def _on_message(self, _bus, msg):
         if msg.type == Gst.MessageType.ERROR:
             err, dbg = msg.parse_error()
-            print(f"[câmera] ERRO ({msg.src.get_name()}): {err.message}\n{dbg}", file=sys.stderr)
+            log(f"[câmera] ERRO ({msg.src.get_name()}): {err.message}\n{dbg}")
             pipe = self.pipeline
 
             def handle():
@@ -812,7 +833,7 @@ class MainWindow(Gtk.ApplicationWindow):
         try:
             self.portal = Portal()
         except GLib.Error as e:
-            print(f"[portal] D-Bus indisponível: {e.message}", file=sys.stderr)
+            log(f"[portal] D-Bus indisponível: {e.message}")
 
         self.cam_win = CameraWindow(app, self._on_camera_window_closed)
         self._build_ui()
@@ -1008,7 +1029,7 @@ class MainWindow(Gtk.ApplicationWindow):
     def _status(self, text, error=False):
         self.lbl_status.set_text(text)
         if error:
-            print(f"[{APP_NAME}] {text}", file=sys.stderr)
+            log(f"[{APP_NAME}] {text}")
 
     def _sync_sensitivity(self):
         busy = self.recorder is not None or self.session is not None
@@ -1243,7 +1264,7 @@ class MainWindow(Gtk.ApplicationWindow):
         if not self.recorder:
             return
         state = "⏸ Pausado" if self.recorder.paused else "Gravando"
-        self._status(f"{state} ({self.rec_desc}) → {os.path.basename(self.rec_path)}")
+        self._status(f"{state} ({self.rec_desc}) → {self.rec_path}")
 
     def _update_pause_ui(self):
         paused = self.recorder.paused if self.recorder else False
@@ -1287,6 +1308,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.recorder.stop()
 
     def _on_recording_done(self, ok, message):
+        frames = self.recorder.frames if self.recorder else 0
         if self.timer_id:
             GLib.source_remove(self.timer_id)
             self.timer_id = 0
@@ -1303,11 +1325,27 @@ class MainWindow(Gtk.ApplicationWindow):
         self.btn_pause.set_label("⏸  Pausar")
         self.btn_pause.remove_css_class("suggested-action")
         self.btn_pause.set_sensitive(False)
+        # Encerrou a gravação: a câmera também fecha (marque "Câmera" de novo para reabrir;
+        # ela também reabre sozinha ao iniciar a próxima gravação).
+        self.cam_win.hide_camera()
         self._set_busy(False)
-        if ok:
-            self._status(f"{message} {os.path.basename(self.rec_path)}")
+        try:
+            size = os.path.getsize(self.rec_path)
+        except OSError:
+            size = -1
+        if ok and size > 4096 and frames > 0:
+            self._status(f"{message} {self.rec_path} ({size / 1048576:.1f} MB)")
+            log(f"[gravação] salvo: {self.rec_path} ({size} bytes)")
         else:
-            self._status(f"Erro na gravação: {message}", error=True)
+            if size < 0:
+                why = "o arquivo não foi criado"
+            elif frames == 0:
+                why = "nenhum quadro da tela chegou (gravação vazia)"
+            else:
+                why = f"arquivo muito pequeno ({size} bytes)"
+            if not ok:
+                why = f"{message} — {why}"
+            self._status(f"Erro na gravação: {why}. Detalhes em {LOG_FILE}", error=True)
         self.present()
         if self.quit_after_stop:
             self._quit_app()
@@ -1339,6 +1377,13 @@ class App(Gtk.Application):
 
     def do_activate(self):
         if not self.win:
+            # Ícone: instalado pelo install.sh no tema hicolor; rodando direto do repositório,
+            # usa a pasta icons/ ao lado do script.
+            local_icons = os.path.join(os.path.dirname(os.path.realpath(__file__)), "icons")
+            if os.path.isdir(local_icons):
+                Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(
+                    local_icons)
+            Gtk.Window.set_default_icon_name(APP_ID)
             self.win = MainWindow(self)
         self.win.present()
 

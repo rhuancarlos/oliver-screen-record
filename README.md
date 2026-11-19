@@ -1,5 +1,7 @@
 # Oliver Screen Record
 
+<img src="icons/com.oliver.ScreenRecord.svg" width="96" alt="Ícone do Oliver Screen Record">
+
 Programa simples de gravação de tela para Ubuntu/Debian modernos (Ubuntu 25.04, 25.10 e 26.x).
 Grava junto o **áudio do sistema**, o **microfone** e a **câmera** (numa janela flutuante), e permite **pausar/continuar**.
 Funciona em **Wayland** (padrão) e em X11.
@@ -34,7 +36,7 @@ Os arquivos são salvos em `~/Vídeos/Oliver Screen Record/` (a pasta pode ser t
 1. Marque **Câmera**: abre uma janela pequena, sem bordas, mostrando só a câmera.
 2. Arraste a janela até onde ela deve aparecer no vídeo. Tamanho, formato (retângulo/círculo) e espelho podem ser trocados a qualquer momento, inclusive durante a gravação.
 3. Para ela ficar acima das outras janelas, clique com o botão direito nela → **Sempre no topo** (ou `Alt+Espaço` no GNOME).
-4. Para fechar a câmera, desmarque a opção ou pressione `Alt+F4` sobre a janela.
+4. Ao encerrar a gravação, a câmera fecha sozinha. Para fechar antes, desmarque a opção ou pressione `Alt+F4` sobre a janela.
 
 > A câmera aparece no vídeo porque a janela dela é gravada junto com a tela. Se você gravar **uma janela** específica (em vez da tela inteira), a câmera não entra no vídeo.
 > "Minimizar ao gravar" minimiza só a janela de configurações. A janela da câmera continua visível.
@@ -65,4 +67,5 @@ GTK 4 (interface + janela da câmera via gtk4paintablesink)
 * **Vídeo sem áudio do sistema**: rode `pactl get-default-sink` e verifique se a saída padrão é a que está tocando o som. Se não for, escolha a saída certa na lista.
 * **Câmera não listada**: rode `--check`. Câmeras de notebooks recentes (MIPI/IPU6) precisam do `gstreamer1.0-libcamera`. Se a câmera estiver em uso por outro app (Meet, Zoom), feche-o.
 * **Câmera não abre / "instale o pacote gstreamer1.0-gtk4"**: a janela da câmera precisa do `gstreamer1.0-gtk4`. Outros erros aparecem na linha de status. Para detalhes, rode pelo terminal.
+* **Vídeo não aparece na pasta**: o caminho completo aparece no status. O log fica em `~/.cache/oliver-screen-record/oliver-screen-record.log`.
 * **Logs detalhados**: `GST_DEBUG=2 oliver-screen-record`.

@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.3.0] — 2026-11-19
+### Adicionado
+- Ícone próprio do projeto (`icons/com.oliver.ScreenRecord.svg`), usado no menu de aplicativos,
+  na barra de tarefas e nas janelas. Rodando direto pelo `python3`, o app usa a pasta `icons/`.
+- O atalho do menu agora se chama `com.oliver.ScreenRecord.desktop` (igual ao ID do app) e tem
+  `StartupWMClass`, para o GNOME associar a janela ao ícone. O `install.sh` remove o atalho antigo.
+
+## [1.2.1] — 2026-11-19
+### Corrigido
+- A câmera continuava aberta depois de encerrar a gravação. Agora ela fecha junto e reabre
+  sozinha na próxima gravação (ou ao marcar "Câmera" de novo).
+
+### Adicionado
+- Ao terminar, o app confere o arquivo gerado. Se não foi criado, ficou vazio ou nenhum quadro da
+  tela chegou ao encoder, mostra o motivo em vez de "Gravação salva".
+- O status mostra o caminho completo do arquivo.
+- Log em `~/.cache/oliver-screen-record/oliver-screen-record.log` (e no terminal), com o pipeline,
+  o caminho, os erros do GStreamer e o número de quadros gravados.
+
 ## [1.2.0] — 2026-11-19
 ### Alterado
 - A câmera agora abre numa **janela flutuante própria**, que mostra somente a imagem da câmera

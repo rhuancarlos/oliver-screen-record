@@ -6,6 +6,8 @@ APP="oliver-screen-record"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 APPS_DIR="$HOME/.local/share/applications"
+APP_ID="com.oliver.ScreenRecord"
+ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
 
 DEPS=(
   python3 python3-gi
@@ -25,7 +27,8 @@ case "${XDG_CURRENT_DESKTOP:-}" in
 esac
 
 if [[ "${1:-}" == "--uninstall" ]]; then
-  rm -f "$BIN_DIR/$APP" "$APPS_DIR/$APP.desktop"
+  rm -f "$BIN_DIR/$APP" "$APPS_DIR/$APP.desktop" "$APPS_DIR/$APP_ID.desktop" "$ICON_DIR/$APP_ID.svg"
+  gtk-update-icon-cache -q -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
   echo "Oliver Screen Record removido (configurações em ~/.config/$APP mantidas)."
   exit 0
 fi
@@ -40,15 +43,19 @@ sudo apt-get install -y gstreamer1.0-libcamera 2>/dev/null || echo "   (gstreame
 
 echo ">> Copiando programa…"
 install -Dm755 "$DIR/$APP.py" "$BIN_DIR/$APP"
+install -Dm644 "$DIR/icons/$APP_ID.svg" "$ICON_DIR/$APP_ID.svg"
+gtk-update-icon-cache -q -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 
 mkdir -p "$APPS_DIR"
-cat > "$APPS_DIR/$APP.desktop" <<EOF
+rm -f "$APPS_DIR/$APP.desktop"   # nome antigo (até a v1.2.1)
+cat > "$APPS_DIR/$APP_ID.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Oliver Screen Record
 Comment=Gravação de tela com áudio do sistema, microfone e câmera
 Exec=$BIN_DIR/$APP
-Icon=media-record
+Icon=$APP_ID
+StartupWMClass=$APP_ID
 Terminal=false
 Categories=AudioVideo;Video;Recorder;Utility;
 Keywords=screen;record;recorder;webcam;gravar;tela;camera;
