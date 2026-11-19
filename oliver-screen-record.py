@@ -4,14 +4,14 @@
 Oliver Screen Record
 --------------------
 Gravação de tela para Ubuntu/Debian modernos (Ubuntu >= 25.04), com áudio do
-sistema, microfone e câmera sobreposta (arrastável), além de pausa/continuação.
+sistema, microfone e câmera (janela flutuante), além de pausa/continuação.
 
 Funciona em Wayland (padrão no Ubuntu 25.10+/26.x) e X11, usando:
   * xdg-desktop-portal (ScreenCast)  -> permissão e seleção de tela/janela
   * PipeWire                         -> fluxo de vídeo da tela
   * PulseAudio API (pipewire-pulse)  -> áudio do sistema (monitor) e microfone
-  * GStreamer                        -> câmera, composição, codificação e gravação
-  * GTK 4                            -> interface e prévia ao vivo
+  * GStreamer                        -> câmera, codificação e gravação
+  * GTK 4                            -> interface e janela flutuante da câmera
 """
 
 import json
@@ -31,7 +31,7 @@ from gi.repository import Gdk, Gio, GLib, Gst, Gtk, Pango  # noqa: E402
 
 APP_ID = "com.oliver.ScreenRecord"
 APP_NAME = "Oliver Screen Record"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 PORTAL_BUS = "org.freedesktop.portal.Desktop"
 PORTAL_PATH = "/org/freedesktop/portal/desktop"
@@ -61,18 +61,10 @@ FORMATS = [
      "mux": "webmmux"},
 ]
 
-# Câmera: posições pré-definidas (fração do espaço livre em x, y) e tamanhos (fração da largura)
-CAM_POSITIONS = [
-    ("Inferior direito", 1.0, 1.0),
-    ("Inferior esquerdo", 0.0, 1.0),
-    ("Superior direito", 1.0, 0.0),
-    ("Superior esquerdo", 0.0, 0.0),
-    ("Personalizada (arrastada)", None, None),
-]
-CAM_CUSTOM = len(CAM_POSITIONS) - 1
-CAM_SIZES = [("Pequena", 0.16), ("Média", 0.22), ("Grande", 0.30)]
-CAM_PROCESS_WIDTH = 640     # largura em que a câmera é processada antes da composição
-PREVIEW_WIDTH = 480
+# Câmera (janela flutuante): largura da janela em pixels e formato
+CAM_SIZES = [("Pequena", 220), ("Média", 300), ("Grande", 420)]
+CAM_SHAPES = [("Retângulo", "rect"), ("Círculo", "circle")]
+CAM_PROCESS_WIDTH = 640     # largura em que a câmera é decodificada para exibição
 
 # elemento GStreamer -> pacote Debian/Ubuntu
 REQUIRED_ELEMENTS = {
@@ -94,8 +86,19 @@ REQUIRED_ELEMENTS = {
     "jpegdec": "gstreamer1.0-plugins-good",
     "v4l2src": "gstreamer1.0-plugins-good",
 }
-OPTIONAL_ELEMENTS = {"gtk4paintablesink": "gstreamer1.0-gtk4"}  # prévia ao vivo
+OPTIONAL_ELEMENTS = {"gtk4paintablesink": "gstreamer1.0-gtk4"}  # janela da câmera
 AAC_ENCODERS = ["fdkaacenc", "avenc_aac", "voaacenc"]
+
+
+def caps_size(info):
+    """(largura, altura) de um evento CAPS recebido num probe, ou None."""
+    event = info.get_event()
+    if event.type != Gst.EventType.CAPS:
+        return None
+    st = event.parse_caps().get_structure(0)
+    ok_w, w = st.get_int("width")
+    ok_h, h = st.get_int("height")
+    return (w, h) if ok_w and ok_h else None
 
 
 def has_element(name):
@@ -121,7 +124,7 @@ class Config(dict):
             "sys_audio": True, "mic": True, "remember": False, "restore_token": "",
             "minimize": True, "start_paused": False,
             "camera": False, "camera_name": "", "mirror": True,
-            "cam_pos": 0, "cam_size": 1, "cam_fx": 1.0, "cam_fy": 1.0,
+            "cam_size": 1, "cam_shape": 0,
         })
         try:
             with open(CONFIG_FILE, encoding="utf-8") as f:
@@ -232,11 +235,13 @@ def list_cameras():
 
         # Escolhe um formato que o dispositivo realmente oferece (bruto ou MJPEG)
         caps = dev.get_caps()
+        # ('base' fica guardado para o fallback com decodebin)
+        base = src
         if caps and caps.can_intersect(Gst.Caps.from_string(CAM_RAW_CAPS)):
             src += f" ! {CAM_RAW_CAPS}"
         elif caps and caps.can_intersect(Gst.Caps.from_string(CAM_JPEG_CAPS)):
             src += f" ! {CAM_JPEG_CAPS} ! jpegdec"
-        cams.append({"label": f"{dev.get_display_name()} ({api})", "src": src})
+        cams.append({"label": f"{dev.get_display_name()} ({api})", "src": src, "base": base})
 
     order = {"V4L2": 0, "libcamera": 1, "PipeWire": 2}
     cams.sort(key=lambda c: order.get(c["label"].rsplit("(", 1)[-1].rstrip(")"), 9))
@@ -410,29 +415,24 @@ class ScreenCastSession:
 # --------------------------------------------------------------------------- #
 class Recorder:
     """
-    Tela ─▶ videorate ─▶ I420 ─▶ escala (par) ─┐
-                                               ├─▶ compositor ─▶ tee ─┬─▶ [portão] ─▶ encoder ─┐
-    Câmera ─▶ videorate ─▶ espelho ─▶ escala ──┘                      └─▶ prévia (GTK)         ├─▶ mux
-    Sistema/Microfone ─▶ audiomixer ─▶ [portão] ─▶ encoder de áudio ──────────────────────────┘
+    Tela ─▶ videorate ─▶ I420 ─▶ escala (par) ─▶ [portão] ─▶ encoder de vídeo ─┐
+    Sistema/Microfone ─▶ audiomixer ─▶ [portão] ─▶ encoder de áudio ───────────┴─▶ mux
+
+    A câmera NÃO passa por aqui: ela é exibida numa janela flutuante própria
+    (CameraWindow), que aparece no vídeo por ser gravada junto com a tela.
 
     A pausa NÃO pausa o pipeline: os "portões" descartam os buffers antes dos encoders e,
     ao continuar, um offset negativo é aplicado aos pads para remover o intervalo pausado
-    dos timestamps. Assim a prévia segue ao vivo durante a pausa e o arquivo fica contínuo.
+    dos timestamps. Assim o arquivo fica contínuo e áudio/vídeo seguem sincronizados.
     """
 
     def __init__(self, fd, node_id, *, fps, quality, fmt, sys_dev, mic_dev, path,
-                 camera=None, mirror=True, cam_layout=(1.0, 1.0, 0.22), preview=False,
                  start_paused=False, on_done=None):
         self.fd = fd
         self.path = path
         self.on_done = on_done  # on_done(ok: bool, message: str)
         self.pipeline = None
-        self.preview_paintable = None
         self.video_size = None          # (W, H) da saída
-        self.camera_rect = None         # (x, y, w, h) da câmera na saída
-        self._cam_pad = None
-        self._cam_aspect = None         # altura/largura da câmera
-        self._cam_fx, self._cam_fy, self._cam_size = cam_layout
         self._finished = False
         self._eos_timeout = 0
         self._sized = False
@@ -441,7 +441,7 @@ class Recorder:
         self._paused = start_paused
         self._pause_started = 0 if start_paused else None
         self._pause_total = 0
-        self._build(node_id, fps, quality, fmt, sys_dev, mic_dev, camera, mirror, preview)
+        self._build(node_id, fps, quality, fmt, sys_dev, mic_dev)
 
     # ---------- construção ----------
     @staticmethod
@@ -451,7 +451,7 @@ class Recorder:
                 return f"{name} bitrate=192000 ! aacparse"
         return None
 
-    def _build(self, node_id, fps, quality, fmt, sys_dev, mic_dev, camera, mirror, preview):
+    def _build(self, node_id, fps, quality, fmt, sys_dev, mic_dev):
         _, q264, qvp8 = QUALITIES[quality]
         gop = fps * 2
 
@@ -468,43 +468,18 @@ class Recorder:
             aenc = "opusenc bitrate=160000"
 
         big_queue = "queue max-size-time=3000000000 max-size-buffers=0 max-size-bytes=0"
-        leaky1 = "queue leaky=downstream max-size-buffers=1 max-size-time=0 max-size-bytes=0"
 
         # Tela: fila "leaky" evita travar o PipeWire caso o encoder atrase;
         # keepalive reenvia o último quadro quando a tela fica parada.
-        screen = (
+        desc = [
+            f"{fmt['mux']} name=mux ! filesink name=sink",
             f"pipewiresrc fd={self.fd} path={node_id} do-timestamp=true keepalive-time=1000 "
             "! queue leaky=downstream max-size-buffers=5 max-size-time=0 max-size-bytes=0 "
             f"! videorate ! video/x-raw,framerate={fps}/1 "
             "! videoconvert ! video/x-raw,format=I420 "
-            "! videoscale name=vscale add-borders=true ! capsfilter name=vsize ")
-
-        desc = [f"{fmt['mux']} name=mux ! filesink name=sink"]
-        preview = preview and has_element("gtk4paintablesink")
-
-        if camera:
-            flip = "! videoflip method=horizontal-flip " if mirror else ""
-            desc += [
-                screen + "! comp.sink_0",
-                f"{camera['src']} ! queue leaky=downstream max-size-buffers=3 max-size-time=0 "
-                f"max-size-bytes=0 ! videorate ! video/x-raw,framerate={fps}/1 ! videoconvert "
-                f"{flip}! videoscale ! capsfilter name=camcaps "
-                f"caps=video/x-raw,width={CAM_PROCESS_WIDTH},pixel-aspect-ratio=1/1 "
-                "! comp.sink_1",
-                # alpha=0 até sabermos o tamanho da tela e da câmera (evita "piscar")
-                "compositor name=comp background=black sink_0::zorder=0 "
-                "sink_1::zorder=1 sink_1::alpha=0 "
-                f"! video/x-raw,framerate={fps}/1 ! videoconvert ! video/x-raw,format=I420 "
-                "! tee name=vt",
-                f"vt. ! {big_queue} ! queue name=vgate ! {venc} ! queue ! mux.",
-            ]
-            if preview:
-                desc.append(
-                    f"vt. ! {leaky1} ! videorate drop-only=true ! video/x-raw,framerate=15/1 "
-                    f"! videoscale ! video/x-raw,width={PREVIEW_WIDTH} ! videoconvert "
-                    "! gtk4paintablesink name=preview sync=false async=false")
-        else:
-            desc.append(screen + f"! {big_queue} ! queue name=vgate ! {venc} ! queue ! mux.")
+            "! videoscale name=vscale add-borders=true ! capsfilter name=vsize "
+            f"! {big_queue} ! queue name=vgate ! {venc} ! queue ! mux.",
+        ]
 
         audio_inputs = []
         if sys_dev is not None:
@@ -532,13 +507,6 @@ class Recorder:
         self.pipeline.get_by_name("vscale").get_static_pad("sink").add_probe(
             Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_screen_caps)
 
-        if camera:
-            self._cam_pad = self.pipeline.get_by_name("comp").get_static_pad("sink_1")
-            self.pipeline.get_by_name("camcaps").get_static_pad("src").add_probe(
-                Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_camera_caps)
-        if preview:
-            self.preview_paintable = self.pipeline.get_by_name("preview").get_property("paintable")
-
         # Portões de pausa (saída das filas antes dos encoders)
         for name in ("vgate", "agate"):
             el = self.pipeline.get_by_name(name)
@@ -552,40 +520,21 @@ class Recorder:
         bus.connect("message", self._on_message)
 
     # ---------- probes ----------
-    @staticmethod
-    def _caps_size(info):
-        event = info.get_event()
-        if event.type != Gst.EventType.CAPS:
-            return None
-        s = event.parse_caps().get_structure(0)
-        ok_w, w = s.get_int("width")
-        ok_h, h = s.get_int("height")
-        return (w, h) if ok_w and ok_h else None
-
     def _on_screen_caps(self, _pad, info):
-        size = self._caps_size(info)
+        size = caps_size(info)
         if size and not self._sized:
             self._sized = True
             w, h = size[0] - size[0] % 2, size[1] - size[1] % 2
             self.video_size = (w, h)
             self.pipeline.get_by_name("vsize").set_property("caps", Gst.Caps.from_string(
                 f"video/x-raw,width={w},height={h},pixel-aspect-ratio=1/1"))
-            GLib.idle_add(self._apply_layout)
             return Gst.PadProbeReturn.REMOVE
-        return Gst.PadProbeReturn.OK
-
-    def _on_camera_caps(self, _pad, info):
-        size = self._caps_size(info)
-        if size:
-            self._cam_aspect = size[1] / size[0]
-            GLib.idle_add(self._apply_layout)
         return Gst.PadProbeReturn.OK
 
     def _gate_probe(self, pad, info):
         if self._paused:
             return Gst.PadProbeReturn.DROP
-        # Descarta quadros com timestamp repetido/regressivo (o compositor pode duplicar
-        # o PTS 0 quando a câmera demora a iniciar; o x264 + MP4 não toleram isso).
+        # Descarta quadros com timestamp repetido/regressivo (o x264 + MP4 não toleram isso).
         pts = info.get_buffer().pts
         if pts != Gst.CLOCK_TIME_NONE:
             last = self._last_pts.get(pad)
@@ -593,45 +542,6 @@ class Recorder:
                 return Gst.PadProbeReturn.DROP
             self._last_pts[pad] = pts
         return Gst.PadProbeReturn.OK
-
-    # ---------- câmera ----------
-    def _cam_geometry(self):
-        W, H = self.video_size
-        cw = int(W * self._cam_size) & ~1
-        ch = min(int(cw * self._cam_aspect) & ~1, H)
-        margin = int(min(W, H) * 0.025)
-        return W, H, cw, ch, margin
-
-    def _apply_layout(self):
-        if not (self._cam_pad and self.video_size and self._cam_aspect):
-            return False
-        W, H, cw, ch, m = self._cam_geometry()
-        x = m + int(self._cam_fx * max(0, W - cw - 2 * m))
-        y = m + int(self._cam_fy * max(0, H - ch - 2 * m))
-        for prop, val in (("xpos", x), ("ypos", y), ("width", cw), ("height", ch)):
-            self._cam_pad.set_property(prop, val)
-        self._cam_pad.set_property("alpha", 1.0)
-        self.camera_rect = (x, y, cw, ch)
-        return False
-
-    def set_camera_layout(self, fx=None, fy=None, size=None):
-        if fx is not None:
-            self._cam_fx = min(max(fx, 0.0), 1.0)
-        if fy is not None:
-            self._cam_fy = min(max(fy, 0.0), 1.0)
-        if size is not None:
-            self._cam_size = size
-        self._apply_layout()
-
-    def move_camera_to(self, x, y):
-        """Move o canto superior esquerdo da câmera para (x, y) em coordenadas do vídeo.
-        Retorna as frações (fx, fy) resultantes."""
-        if not (self.video_size and self._cam_aspect):
-            return self._cam_fx, self._cam_fy
-        W, H, cw, ch, m = self._cam_geometry()
-        free_w, free_h = max(1, W - cw - 2 * m), max(1, H - ch - 2 * m)
-        self.set_camera_layout((x - m) / free_w, (y - m) / free_h)
-        return self._cam_fx, self._cam_fy
 
     # ---------- controle ----------
     def _running_time(self):
@@ -711,6 +621,177 @@ class Recorder:
 
 
 # --------------------------------------------------------------------------- #
+#  Câmera: pipeline de exibição + janela flutuante
+# --------------------------------------------------------------------------- #
+class CameraFeed:
+    """
+    câmera ─▶ fila leaky ─▶ videoconvert ─▶ videoflip (espelho) ─▶ videoscale ─▶ gtk4paintablesink
+
+    Pipeline independente da gravação: abre a câmera assim que a opção é ligada, para
+    posicionar a janela antes de gravar. Se o formato preferido falhar na negociação,
+    tenta de novo uma vez deixando o decodebin escolher o formato.
+    """
+
+    def __init__(self, camera, mirror, on_error):
+        self.camera = camera
+        self.on_error = on_error      # on_error(mensagem)
+        self.pipeline = None
+        self.paintable = None
+        self._flip = None
+        self._fallback_used = False
+        self._mirror = mirror
+        self._build(camera["src"])
+
+    def _build(self, src):
+        self.pipeline = Gst.parse_launch(
+            f"{src} ! queue leaky=downstream max-size-buffers=2 max-size-time=0 "
+            "max-size-bytes=0 ! videoconvert ! videoflip name=flip "
+            f"! videoscale ! video/x-raw,width={CAM_PROCESS_WIDTH},pixel-aspect-ratio=1/1 "
+            "! videoconvert ! gtk4paintablesink name=view sync=false")
+        self._flip = self.pipeline.get_by_name("flip")
+        self.set_mirror(self._mirror)
+        self.paintable = self.pipeline.get_by_name("view").get_property("paintable")
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_message)
+
+    def set_mirror(self, mirror):
+        self._mirror = mirror
+        if self._flip:
+            Gst.util_set_object_arg(self._flip, "method", "horizontal-flip" if mirror else "none")
+
+    def start(self):
+        if self.pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            return self._retry_or_fail("não foi possível abrir a câmera.")
+        return True
+
+    def stop(self):
+        if self.pipeline:
+            self.pipeline.get_bus().remove_signal_watch()
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline = None
+
+    def _retry_or_fail(self, message):
+        base = self.camera.get("base")
+        if not self._fallback_used and base:
+            self._fallback_used = True
+            print(f"[câmera] {message} Tentando outro formato…", file=sys.stderr)
+            self.stop()
+            try:
+                self._build(f"{base} ! decodebin")
+            except GLib.Error as e:
+                self.on_error(e.message)
+                return False
+            self.on_paintable_changed()
+            return self.start()
+        self.stop()
+        self.on_error(message)
+        return False
+
+    def on_paintable_changed(self):
+        """Sobrescrito pela janela para trocar o paintable após o fallback."""
+
+    def _on_message(self, _bus, msg):
+        if msg.type == Gst.MessageType.ERROR:
+            err, dbg = msg.parse_error()
+            print(f"[câmera] ERRO ({msg.src.get_name()}): {err.message}\n{dbg}", file=sys.stderr)
+            pipe = self.pipeline
+
+            def handle():
+                # Ignora erros repetidos de um pipeline que já foi substituído/parado
+                if self.pipeline is pipe and pipe is not None:
+                    self._retry_or_fail(err.message)
+                return False
+            GLib.idle_add(handle)
+
+
+class CameraView(Gtk.Picture):
+    """Gtk.Picture com tamanho fixo: sem isso o GTK usa a resolução da câmera como
+    tamanho natural e a janela fica enorme."""
+
+    def __init__(self):
+        super().__init__(can_shrink=True, content_fit=Gtk.ContentFit.COVER)
+        self.size = (300, 225)
+
+    def set_fixed_size(self, w, h):
+        self.size = (w, h)
+        self.queue_resize()
+
+    def do_measure(self, orientation, _for_size):
+        v = self.size[0] if orientation == Gtk.Orientation.HORIZONTAL else self.size[1]
+        return v, v, -1, -1
+
+
+class CameraWindow(Gtk.Window):
+    """Janela flutuante, sem bordas, que mostra somente a câmera.
+    Arraste para mover; clique direito abre o menu da janela ("Sempre no topo")."""
+
+    def __init__(self, app, on_closed):
+        super().__init__(application=app, title=f"{APP_NAME} — Câmera",
+                         decorated=False, resizable=False)
+        self.add_css_class("camwin")
+        self.feed = None
+        self._on_closed = on_closed
+        self._closing_by_code = False
+
+        self.view = CameraView()
+        self.frame = Gtk.Box(overflow=Gtk.Overflow.HIDDEN)
+        self.frame.add_css_class("camframe")
+        self.frame.append(self.view)
+        # WindowHandle: arrastar move a janela e o clique direito mostra o menu do sistema
+        handle = Gtk.WindowHandle(child=self.frame)
+        self.set_child(handle)
+        self.connect("close-request", self._on_close_request)
+
+    def apply_layout(self, width, shape):
+        circle = CAM_SHAPES[shape][1] == "circle"
+        w = width
+        h = width if circle else width * 3 // 4
+        self.view.set_fixed_size(w, h)
+        if circle:
+            self.frame.add_css_class("circle")
+        else:
+            self.frame.remove_css_class("circle")
+        self.set_default_size(w, h)
+
+    def show_camera(self, camera, mirror, on_error):
+        self.hide_camera()
+        if not has_element("gtk4paintablesink"):
+            on_error("instale o pacote " + " ".join(missing_packages(optional=True)))
+            return False
+        try:
+            self.feed = CameraFeed(camera, mirror, on_error)
+        except GLib.Error as e:
+            on_error(e.message)
+            return False
+        self.feed.on_paintable_changed = lambda: self.view.set_paintable(self.feed.paintable)
+        self.view.set_paintable(self.feed.paintable)
+        if not self.feed.start():
+            return False
+        self.present()
+        return True
+
+    def hide_camera(self):
+        if self.feed:
+            self.feed.stop()
+            self.feed = None
+        self.view.set_paintable(None)
+        self._closing_by_code = True
+        self.set_visible(False)
+        self._closing_by_code = False
+
+    def set_mirror(self, mirror):
+        if self.feed:
+            self.feed.set_mirror(mirror)
+
+    def _on_close_request(self, _win):
+        # Fechada pelo usuário (Alt+F4): desliga a câmera em vez de destruir a janela
+        if not self._closing_by_code:
+            self._on_closed()
+        return True
+
+
+# --------------------------------------------------------------------------- #
 #  Interface
 # --------------------------------------------------------------------------- #
 class MainWindow(Gtk.ApplicationWindow):
@@ -723,17 +804,17 @@ class MainWindow(Gtk.ApplicationWindow):
         self.session = None
         self.recorder = None
         self.rec_path = ""
+        self.rec_desc = ""
         self.timer_id = 0
         self.quit_after_stop = False
         self.sinks, self.mics, self.cams = [], [], []
-        self._drag_origin = None
-        self._updating_pos = False
 
         try:
             self.portal = Portal()
         except GLib.Error as e:
             print(f"[portal] D-Bus indisponível: {e.message}", file=sys.stderr)
 
+        self.cam_win = CameraWindow(app, self._on_camera_window_closed)
         self._build_ui()
         self._refresh_audio()
         self._refresh_cameras()
@@ -742,6 +823,8 @@ class MainWindow(Gtk.ApplicationWindow):
         missing = missing_packages()
         if missing:
             self._status("Pacotes ausentes: " + " ".join(missing), error=True)
+        elif self.chk_cam.get_active():
+            GLib.idle_add(lambda: self._update_camera() and False)
 
     # ---------- construção da UI ----------
     def _build_ui(self):
@@ -752,7 +835,11 @@ class MainWindow(Gtk.ApplicationWindow):
             .rec { color: #e01b24; }
             .paused { color: #e5a50a; }
             .bigbtn { padding: 10px 14px; font-weight: bold; }
-            .preview { background: #000; border-radius: 6px; }
+            window.camwin, window.camwin.background {
+                background: transparent; box-shadow: none; border: none;
+            }
+            .camframe { background: #000; border-radius: 12px; }
+            .camframe.circle { border-radius: 9999px; }
         """)
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
@@ -813,14 +900,15 @@ class MainWindow(Gtk.ApplicationWindow):
         self.chk_cursor = Gtk.CheckButton(label="Mostrar cursor", active=self.cfg["cursor"])
         self.chk_minimize = Gtk.CheckButton(label="Minimizar ao gravar",
                                             active=self.cfg["minimize"])
+        self.chk_minimize.set_tooltip_text(
+            "Minimiza esta janela de configurações. A janela da câmera continua visível.")
         self.chk_remember = Gtk.CheckButton(label="Lembrar tela escolhida",
                                             active=self.cfg["remember"])
         self.chk_remember.set_tooltip_text(
             "Reutiliza a última seleção sem perguntar de novo (portal v4+).")
         checks(self.chk_cursor, self.chk_minimize, self.chk_remember)
         self.chk_start_paused = Gtk.CheckButton(
-            label="Começar pausado (para ajustar a câmera antes)",
-            active=self.cfg["start_paused"])
+            label="Começar pausado", active=self.cfg["start_paused"])
         checks(self.chk_start_paused)
 
         # --- Áudio
@@ -845,23 +933,33 @@ class MainWindow(Gtk.ApplicationWindow):
         btn_cam_refresh.connect("clicked", lambda *_: self._refresh_cameras())
         attach_row(self.chk_cam, self.dd_cam, btn_cam_refresh)
 
-        self.dd_cam_pos = Gtk.DropDown.new_from_strings([p[0] for p in CAM_POSITIONS])
-        self.dd_cam_pos.set_selected(self.cfg["cam_pos"])
-        self.dd_cam_pos.connect("notify::selected", self._on_cam_pos_changed)
-        attach_row("Posição", self.dd_cam_pos)
-
         self.dd_cam_size = Gtk.DropDown.new_from_strings([s[0] for s in CAM_SIZES])
-        self.dd_cam_size.set_selected(self.cfg["cam_size"])
-        self.dd_cam_size.connect("notify::selected", self._on_cam_size_changed)
+        self.dd_cam_size.set_selected(min(self.cfg["cam_size"], len(CAM_SIZES) - 1))
         attach_row("Tamanho", self.dd_cam_size)
+
+        self.dd_cam_shape = Gtk.DropDown.new_from_strings([s[0] for s in CAM_SHAPES])
+        self.dd_cam_shape.set_selected(min(self.cfg["cam_shape"], len(CAM_SHAPES) - 1))
+        attach_row("Formato", self.dd_cam_shape)
 
         self.chk_mirror = Gtk.CheckButton(label="Espelhar câmera", active=self.cfg["mirror"])
         checks(self.chk_mirror)
 
-        for chk, widgets in ((self.chk_sys, [self.dd_sys]), (self.chk_mic, [self.dd_mic]),
-                             (self.chk_cam, [self.dd_cam, self.chk_mirror])):
-            chk.connect("toggled", lambda c, ws=widgets: [w.set_sensitive(c.get_active())
-                                                          for w in ws])
+        hint = Gtk.Label(
+            label="A câmera abre numa janela flutuante: arraste-a para posicioná-la "
+                  "(ela entra no vídeo junto com a tela). Clique direito → “Sempre no topo”.",
+            xalign=0, wrap=True, max_width_chars=60)
+        hint.add_css_class("dim-label")
+        hint.add_css_class("caption")
+        grid.attach(hint, 0, row, 3, 1)
+        row += 1
+
+        self.chk_sys.connect("toggled", lambda *_: self._sync_sensitivity())
+        self.chk_mic.connect("toggled", lambda *_: self._sync_sensitivity())
+        self.chk_cam.connect("toggled", self._on_camera_option_changed)
+        self.dd_cam.connect("notify::selected", self._on_camera_option_changed)
+        self.dd_cam_size.connect("notify::selected", self._on_cam_layout_changed)
+        self.dd_cam_shape.connect("notify::selected", self._on_cam_layout_changed)
+        self.chk_mirror.connect("toggled", self._on_mirror_toggled)
 
         # --- Saída
         section("📁 Saída")
@@ -875,26 +973,6 @@ class MainWindow(Gtk.ApplicationWindow):
         dir_box.append(btn_dir)
         dir_box.append(btn_open)
         attach_row("Pasta", self.lbl_dir, dir_box)
-
-        # --- Prévia (durante a gravação com câmera)
-        self.preview_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
-                                   margin_top=10, visible=False)
-        self.picture = Gtk.Picture(can_shrink=True, content_fit=Gtk.ContentFit.CONTAIN)
-        self.picture.set_size_request(PREVIEW_WIDTH, PREVIEW_WIDTH * 9 // 16)
-        self.picture.add_css_class("preview")
-        drag = Gtk.GestureDrag()
-        drag.connect("drag-begin", self._on_drag_begin)
-        drag.connect("drag-update", self._on_drag_update)
-        drag.connect("drag-end", self._on_drag_end)
-        self.picture.add_controller(drag)
-        motion = Gtk.EventControllerMotion()
-        motion.connect("motion", self._on_preview_motion)
-        self.picture.add_controller(motion)
-        hint = Gtk.Label(label="Arraste a câmera na prévia para movê-la.", xalign=0)
-        hint.add_css_class("dim-label")
-        self.preview_box.append(self.picture)
-        self.preview_box.append(hint)
-        root.append(self.preview_box)
 
         # --- Ações
         actions = Gtk.Box(spacing=8, margin_top=12, homogeneous=True)
@@ -917,13 +995,13 @@ class MainWindow(Gtk.ApplicationWindow):
         status_box.append(self.lbl_status)
         root.append(status_box)
 
-        # Posição e tamanho da câmera continuam editáveis durante a gravação
+        # A câmera (liga/desliga, tamanho, formato, espelho) continua editável durante a gravação
         self.settings_widgets = [
             self.dd_source, self.spin_fps, self.dd_quality, self.dd_format, self.chk_cursor,
             self.chk_remember, self.chk_start_paused, self.chk_sys, self.dd_sys, self.chk_mic,
-            self.dd_mic, self.chk_cam, self.dd_cam, self.chk_mirror, btn_refresh,
-            btn_cam_refresh, btn_dir,
+            self.dd_mic, btn_refresh, btn_dir,
         ]
+        self._apply_cam_layout()
         self._sync_sensitivity()
 
     # ---------- utilidades ----------
@@ -933,10 +1011,13 @@ class MainWindow(Gtk.ApplicationWindow):
             print(f"[{APP_NAME}] {text}", file=sys.stderr)
 
     def _sync_sensitivity(self):
-        self.dd_sys.set_sensitive(self.chk_sys.get_active())
-        self.dd_mic.set_sensitive(self.chk_mic.get_active())
-        self.dd_cam.set_sensitive(self.chk_cam.get_active() and bool(self.cams))
-        self.chk_mirror.set_sensitive(self.chk_cam.get_active())
+        busy = self.recorder is not None or self.session is not None
+        self.dd_sys.set_sensitive(self.chk_sys.get_active() and not busy)
+        self.dd_mic.set_sensitive(self.chk_mic.get_active() and not busy)
+        cam_on = self.chk_cam.get_active()
+        self.dd_cam.set_sensitive(cam_on and bool(self.cams))
+        for w in (self.dd_cam_size, self.dd_cam_shape, self.chk_mirror):
+            w.set_sensitive(cam_on)
 
     def _refresh_audio(self):
         self.sinks = list_audio("sinks")
@@ -949,13 +1030,20 @@ class MainWindow(Gtk.ApplicationWindow):
         self.dd_mic.set_selected(0)
 
     def _refresh_cameras(self):
+        was_open = self.cam_win.feed is not None
+        if was_open:
+            self.cam_win.hide_camera()  # libera o dispositivo antes de listar
         self.cams = list_cameras()
         labels = [c["label"] for c in self.cams] or ["Nenhuma câmera encontrada"]
+        self._updating_cams = True
         self.dd_cam.set_model(Gtk.StringList.new(labels))
         names = [c["label"] for c in self.cams]
         if self.cfg.get("camera_name") in names:
             self.dd_cam.set_selected(names.index(self.cfg["camera_name"]))
+        self._updating_cams = False
         self._sync_sensitivity()
+        if was_open:
+            self._update_camera()
 
     def _selected_audio(self):
         """Retorna (sys_dev, mic_dev). sys_dev None = desligado; mic_dev False = desligado,
@@ -975,13 +1063,6 @@ class MainWindow(Gtk.ApplicationWindow):
             return None
         return self.cams[min(self.dd_cam.get_selected(), len(self.cams) - 1)]
 
-    def _cam_layout(self):
-        pos = self.dd_cam_pos.get_selected()
-        _, fx, fy = CAM_POSITIONS[pos]
-        if fx is None:
-            fx, fy = self.cfg["cam_fx"], self.cfg["cam_fy"]
-        return fx, fy, CAM_SIZES[self.dd_cam_size.get_selected()][1]
-
     def _save_cfg(self):
         cam = self._selected_camera()
         self.cfg.update({
@@ -992,8 +1073,8 @@ class MainWindow(Gtk.ApplicationWindow):
             "minimize": self.chk_minimize.get_active(),
             "start_paused": self.chk_start_paused.get_active(),
             "camera": self.chk_cam.get_active(), "mirror": self.chk_mirror.get_active(),
-            "cam_pos": self.dd_cam_pos.get_selected(),
             "cam_size": self.dd_cam_size.get_selected(),
+            "cam_shape": self.dd_cam_shape.get_selected(),
         })
         if cam:
             self.cfg["camera_name"] = cam["label"]
@@ -1035,71 +1116,51 @@ class MainWindow(Gtk.ApplicationWindow):
         Gio.AppInfo.launch_default_for_uri(
             Gio.File.new_for_path(self.cfg["output_dir"]).get_uri(), None)
 
-    # ---------- câmera: posição, tamanho e arraste na prévia ----------
-    def _on_cam_pos_changed(self, *_):
-        if self._updating_pos:
+    # ---------- câmera (janela flutuante) ----------
+    _updating_cams = False
+
+    def _apply_cam_layout(self):
+        self.cam_win.apply_layout(CAM_SIZES[self.dd_cam_size.get_selected()][1],
+                                  self.dd_cam_shape.get_selected())
+
+    def _update_camera(self):
+        """Abre/fecha a janela da câmera conforme as opções atuais."""
+        self._sync_sensitivity()
+        if not self.chk_cam.get_active():
+            self.cam_win.hide_camera()
             return
-        fx, fy, _ = self._cam_layout()
-        if self.recorder:
-            self.recorder.set_camera_layout(fx, fy)
+        camera = self._selected_camera()
+        if not camera:
+            self.cam_win.hide_camera()
+            self._status("Nenhuma câmera encontrada. Conecte uma e clique em atualizar.",
+                         error=True)
+            return
+        self._apply_cam_layout()
+        if self.cam_win.show_camera(camera, self.chk_mirror.get_active(),
+                                    self._on_camera_error):
+            if not self.recorder:
+                self._status(f"Câmera aberta: {camera['label']}")
+
+    def _on_camera_error(self, message):
+        self.cam_win.hide_camera()
+        self._status(f"Erro na câmera: {message} (está em uso por outro app?)", error=True)
+
+    def _on_camera_option_changed(self, *_):
+        if self._updating_cams:
+            return
+        self._update_camera()
         self._save_cfg()
 
-    def _on_cam_size_changed(self, *_):
-        if self.recorder:
-            self.recorder.set_camera_layout(size=CAM_SIZES[self.dd_cam_size.get_selected()][1])
+    def _on_cam_layout_changed(self, *_):
+        self._apply_cam_layout()
         self._save_cfg()
 
-    def _preview_mapping(self):
-        """Retorna (escala, offset_x, offset_y) entre a prévia (widget) e o vídeo."""
-        if not (self.recorder and self.recorder.video_size):
-            return None
-        W, H = self.recorder.video_size
-        pw, ph = self.picture.get_width(), self.picture.get_height()
-        if pw <= 0 or ph <= 0:
-            return None
-        s = min(pw / W, ph / H)
-        return s, (pw - W * s) / 2, (ph - H * s) / 2
+    def _on_mirror_toggled(self, *_):
+        self.cam_win.set_mirror(self.chk_mirror.get_active())
+        self._save_cfg()
 
-    def _hit_camera(self, x, y):
-        m = self._preview_mapping()
-        rect = self.recorder.camera_rect if self.recorder else None
-        if not (m and rect):
-            return False
-        s, ox, oy = m
-        vx, vy = (x - ox) / s, (y - oy) / s
-        cx, cy, cw, ch = rect
-        return cx <= vx <= cx + cw and cy <= vy <= cy + ch
-
-    def _on_preview_motion(self, _ctrl, x, y):
-        if self._drag_origin is None:
-            self.picture.set_cursor_from_name("grab" if self._hit_camera(x, y) else None)
-
-    def _on_drag_begin(self, gesture, x, y):
-        if self._hit_camera(x, y):
-            self._drag_origin = self.recorder.camera_rect[:2]
-            self.picture.set_cursor_from_name("grabbing")
-        else:
-            self._drag_origin = None
-            gesture.set_state(Gtk.EventSequenceState.DENIED)
-
-    def _on_drag_update(self, _gesture, dx, dy):
-        m = self._preview_mapping()
-        if self._drag_origin is None or not m:
-            return
-        s = m[0]
-        fx, fy = self.recorder.move_camera_to(self._drag_origin[0] + dx / s,
-                                              self._drag_origin[1] + dy / s)
-        self.cfg["cam_fx"], self.cfg["cam_fy"] = fx, fy
-        if self.dd_cam_pos.get_selected() != CAM_CUSTOM:
-            self._updating_pos = True
-            self.dd_cam_pos.set_selected(CAM_CUSTOM)
-            self._updating_pos = False
-
-    def _on_drag_end(self, *_):
-        if self._drag_origin is not None:
-            self._drag_origin = None
-            self.picture.set_cursor_from_name("grab")
-            self._save_cfg()
+    def _on_camera_window_closed(self):
+        self.chk_cam.set_active(False)  # dispara _on_camera_option_changed
 
     # ---------- gravação ----------
     def _on_record_clicked(self, _btn):
@@ -1116,10 +1177,10 @@ class MainWindow(Gtk.ApplicationWindow):
         if missing:
             self._status("Instale os pacotes: " + " ".join(missing), error=True)
             return
-        if self.chk_cam.get_active() and not self.cams:
-            self._status("Nenhuma câmera encontrada. Desmarque “Câmera” ou conecte uma.",
-                         error=True)
-            return
+        if self.chk_cam.get_active() and self.cam_win.feed is None:
+            self._update_camera()
+            if self.cam_win.feed is None:
+                return  # mensagem de erro já exibida
         self._save_cfg()
         self._set_busy(True)
         self.btn_rec.set_sensitive(False)
@@ -1146,15 +1207,12 @@ class MainWindow(Gtk.ApplicationWindow):
             self.cfg.save()
         fmt = FORMATS[self.dd_format.get_selected()]
         sys_dev, mic_dev = self._selected_audio()
-        camera = self._selected_camera()
         path = self._output_path(fmt["ext"])
         try:
             self.recorder = Recorder(
                 fd, node_id, fps=int(self.spin_fps.get_value()),
                 quality=self.dd_quality.get_selected(), fmt=fmt, sys_dev=sys_dev,
-                mic_dev=mic_dev, path=path, camera=camera,
-                mirror=self.chk_mirror.get_active(), cam_layout=self._cam_layout(),
-                preview=camera is not None, start_paused=self.chk_start_paused.get_active(),
+                mic_dev=mic_dev, path=path, start_paused=self.chk_start_paused.get_active(),
                 on_done=self._on_recording_done)
         except GLib.Error as e:
             os.close(fd)
@@ -1165,11 +1223,6 @@ class MainWindow(Gtk.ApplicationWindow):
             return
 
         self.rec_path = path
-        if self.recorder.preview_paintable:
-            self.picture.set_paintable(self.recorder.preview_paintable)
-            self.preview_box.set_visible(True)
-        elif camera and missing_packages(optional=True):
-            self._status("Sem prévia: instale " + " ".join(missing_packages(optional=True)))
         self.timer_id = GLib.timeout_add(250, self._tick)
         self.btn_rec.set_label("⏹  Parar gravação")
         self.btn_rec.remove_css_class("suggested-action")
@@ -1180,7 +1233,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
         extras = [n for n, on in (("áudio do sistema", sys_dev is not None),
                                   ("microfone", mic_dev is not False),
-                                  ("câmera", camera is not None)) if on]
+                                  ("câmera", self.cam_win.feed is not None)) if on]
         self.rec_desc = (" + ".join(extras) if extras else "sem áudio")
         self._update_status_line()
         if self.chk_minimize.get_active() and not self.recorder.paused:
@@ -1241,8 +1294,6 @@ class MainWindow(Gtk.ApplicationWindow):
         if self.session:
             self.session.close()
             self.session = None
-        self.picture.set_paintable(None)
-        self.preview_box.set_visible(False)
         self.lbl_timer.remove_css_class("rec")
         self.lbl_timer.remove_css_class("paused")
         self.btn_rec.set_label("⏺  Iniciar gravação")
@@ -1259,7 +1310,11 @@ class MainWindow(Gtk.ApplicationWindow):
             self._status(f"Erro na gravação: {message}", error=True)
         self.present()
         if self.quit_after_stop:
-            self.get_application().quit()
+            self._quit_app()
+
+    def _quit_app(self):
+        self.cam_win.hide_camera()
+        self.get_application().quit()
 
     def _on_close_request(self, _win):
         self._save_cfg()
@@ -1269,11 +1324,12 @@ class MainWindow(Gtk.ApplicationWindow):
             return True  # aguarda finalizar o arquivo
         if self.session:
             self.session.close()
+        # A janela da câmera é outra toplevel da aplicação: sem isso o app não fecharia
+        self._quit_app()
         return False
 
     def request_quit(self):
-        if not self._on_close_request(self):
-            self.get_application().quit()
+        self._on_close_request(self)
 
 
 class App(Gtk.Application):
@@ -1298,7 +1354,7 @@ def main():
         print("OK: todas as dependências GStreamer encontradas." if not missing
               else "Faltando: sudo apt install " + " ".join(missing))
         if optional:
-            print("Opcional (prévia da câmera): sudo apt install " + " ".join(optional))
+            print("Necessário para a câmera: sudo apt install " + " ".join(optional))
         cams = list_cameras()
         print("Câmeras: " + (", ".join(c["label"] for c in cams) if cams else "nenhuma"))
         return 1 if missing else 0

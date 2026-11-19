@@ -33,8 +33,8 @@ fi
 echo ">> Instalando dependências (sudo)…"
 sudo apt-get update -q
 sudo apt-get install -y "${DEPS[@]}"
-# Opcional: prévia ao vivo da câmera (gst-plugins-rs)
-sudo apt-get install -y gstreamer1.0-gtk4 2>/dev/null || echo "   (gstreamer1.0-gtk4 indisponível: a gravação funciona, mas sem prévia)"
+# Janela da câmera (gst-plugins-rs)
+sudo apt-get install -y gstreamer1.0-gtk4 2>/dev/null || echo "   (gstreamer1.0-gtk4 indisponível: a gravação funciona, mas sem câmera)"
 # Opcional: câmeras que só funcionam via libcamera (ex.: MIPI/IPU6 de notebooks recentes)
 sudo apt-get install -y gstreamer1.0-libcamera 2>/dev/null || echo "   (gstreamer1.0-libcamera indisponível, ignorando)"
 
