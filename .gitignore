@@ -1,0 +1,30 @@
+# Pacotes e releases (gerados pelo CI a partir da tag, não versionar)
+*.tar.gz
+*.tgz
+*.zip
+dist/
+build/
+
+# Cópia extraída do pacote: tem o próprio .git e viraria repositório aninhado
+oliver-screen-record-v*/
+
+# Gravações de teste
+*.mkv
+*.mp4
+*.webm
+*.png
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Editores / SO
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

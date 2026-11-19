@@ -1,0 +1,41 @@
+name: Release
+
+# Ao enviar uma tag vX.Y.Z, gera o pacote e publica a release no GitHub.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Conferir versão da tag x APP_VERSION
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          app="$(grep -oP '^APP_VERSION = "\K[^"]+' oliver-screen-record.py)"
+          if [ "$tag" != "$app" ]; then
+            echo "Tag ($tag) difere de APP_VERSION ($app) em oliver-screen-record.py" >&2
+            exit 1
+          fi
+
+      - name: Gerar pacote
+        run: |
+          name="oliver-screen-record-${GITHUB_REF_NAME}"
+          git archive --format=tar.gz --prefix="${name}/" -o "${name}.tar.gz" "${GITHUB_REF_NAME}"
+          sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "oliver-screen-record-${GITHUB_REF_NAME}.tar.gz" \
+            "oliver-screen-record-${GITHUB_REF_NAME}.tar.gz.sha256" \
+            --title "Oliver Screen Record ${GITHUB_REF_NAME}" \
+            --generate-notes
